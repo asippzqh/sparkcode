@@ -1,0 +1,141 @@
+import org.apache.spark.streaming.{Duration, Seconds, StreamingContext}
+import org.apache.spark.{SparkConf, SparkContext}
+import org.apache.spark.streaming.kafka.KafkaUtils
+import java.util.{Locale, Properties}
+import java.text.SimpleDateFormat
+
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.SQLContext
+
+
+object kafkaLogAnal {
+
+  val DEBUG:Boolean = false
+
+  //日志处理后的模型
+  case class client(
+                     var linkTime:String,
+                     var pid:Integer,
+                     var user:String,
+                     var host:String,
+                     var status:String
+                   )
+  case class operation(
+                        var linkTime: String,
+                        var pid: Integer,
+                        var hooktype: String,
+                        var tree: String,
+                        var shot: Integer,
+                        var nodepath: String
+                      )
+  def main(args: Array[String]): Unit = {
+    if (args.length<4)
+      println("error")
+    //createStream函数的参数设置
+    val zkQuorum:String = "master01:2181,master02:2181,slave01:2181,slave02:2181,slave03:2181,slave04:2181,slave05:2181"
+    val groupid:String = "1"
+    val topics = Map("mdsplus-topic"->1)
+    val sparkConf = new SparkConf().setAppName("mdslogAnalsys").setMaster("spark://master01:7077,master02:7077")
+    val sc = new SparkContext(sparkConf)
+
+    val ssc = new StreamingContext(sc,Seconds(1))
+    ssc.checkpoint("checkpoint")
+    val logs = KafkaUtils.createStream(ssc,zkQuorum,groupid,topics).map(_._2)
+
+    //mysql配置文件
+    val property = new Properties()
+    property.setProperty("user","admin")
+    property.setProperty("password","admin")
+
+    // 开始处理整个日志内容
+
+    logs.foreachRDD(logs=>{
+      //创建一个sqlcontext单例模式
+      val sQLContext = SQLContextSingleton.getInstance(logs.sparkContext)
+      import sQLContext.implicits._
+      //client日志内容处理
+      var flag ="OFF"
+      val logClient = logs.filter({s=>
+        s.contains("Connection")
+      }).map({k=>
+        k.split(" ")
+      }).map({t=>
+        if(t(9)=="received")
+          flag="ON"
+        else
+          flag="OFF"
+        client(
+          linkTime = t(0)+" "+t(1)+" "+t(2)+" "+t(3)+" "+t(4),//后面转换成timeStamp
+          pid = t(7).replace(")","").toInt,
+          user = t(11).split("@")(0),
+          host = t(11).split("@")(1),
+          status = flag
+        )
+      }).toDF
+      logClient.registerTempTable("client")
+      //对象回收
+      //operation日志内容处理
+      val logOperation = logs.filter(_.contains("hook")
+      ).map(_.split(" ")
+      ).map({t=>
+          operation(
+          linkTime = t(0)+" "+t(1)+" "+t(2)+" "+t(3)+" "+t(4),//后面转换成timeStamp
+          pid = t(6).replace(")","").toInt,
+          hooktype = t(7),
+          tree = t(11).split("=")(1).replace(",",""),
+          shot = t(12).split("=")(1).replace(",","").toInt,
+          nodepath = t(13).split("=")(1)
+        )
+      }).toDF.cache()
+
+      logOperation.registerTempTable("operation")
+
+
+
+      //client读取插入数据库
+      def processClient: Unit ={
+        val queryResult = sQLContext.sql("""
+    select linkTime, pid, user, host, status
+        from client""")
+
+        if(DEBUG)
+          queryResult.show
+        else
+          queryResult.write.mode("append").jdbc("jdbc:mysql://mysqlServer:3306/qhzhang","client",property)
+      }
+
+      //operation读取插入数据库
+
+      def processOperation: Unit ={
+        val queryResult = sQLContext.sql("""
+    select linkTime, pid, hooktype, tree, shot, nodepath
+        from operation""")
+
+        if(DEBUG)
+          queryResult.show
+        else
+          queryResult.write.mode("append").jdbc("jdbc:mysql://10.12.3.232:3306/qhzhang","operation",property)
+      }
+
+      processClient
+      processOperation
+    }
+    )
+
+    ssc.start()
+    ssc.awaitTermination()
+
+
+  }
+}
+
+
+object SQLContextSingleton {
+  @transient  private var instance: SQLContext = _
+  def getInstance(sparkContext: SparkContext): SQLContext = {
+    if (instance == null) {
+      instance = new SQLContext(sparkContext)
+    }
+    instance
+  }
+}
