@@ -86,7 +86,7 @@ object kafkaLogAnal {
           shot = t(12).split("=")(1).replace(",","").toInt,
           nodepath = t(13).split("=")(1)
         )
-      }).toDF.cache()
+      }).toDF
 
       logOperation.registerTempTable("operation")
 
